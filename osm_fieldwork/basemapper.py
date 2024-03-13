@@ -24,10 +24,13 @@ import concurrent.futures
 import logging
 import queue
 import re
+import os
 import sys
 import threading
+import json
 from pathlib import Path
 from typing import Union
+from io import BytesIO, RawIOBase  # Import from BytesIO
 
 import geojson
 import mercantile
@@ -75,7 +78,8 @@ def dlthread(
     # start = datetime.now()
 
     # totaltime = 0.0
-    log.info("Downloading %d tiles in thread %d to %s" % (len(tiles), threading.get_ident(), dest))
+    log.info("Downloading %d tiles in thread %d to %s" %
+             (len(tiles), threading.get_ident(), dest))
     for tile in tiles:
         filespec = f"{tile[2]}/{tile[1]}/{tile[0]}"
         for site in mirrors:
@@ -108,7 +112,8 @@ def dlthread(
                 filespec += "." + site["suffix"]
             outfile = dest + "/" + filespec
             if not Path(outfile).exists():
-                dl = SmartDL(remote, dest=outfile, connect_default_logger=False)
+                dl = SmartDL(remote, dest=outfile,
+                             connect_default_logger=False)
                 dl.start()
             else:
                 log.debug("%s exists!" % (outfile))
@@ -125,7 +130,7 @@ class BaseMapper(object):
 
     def __init__(
         self,
-        boundary: str,
+        boundary: Union[str, bytes],
         base: str,
         source: str,
         xy: bool,
@@ -133,7 +138,7 @@ class BaseMapper(object):
         """Create an tile basemap for ODK Collect.
 
         Args:
-            boundary (str): A BBOX string or GeoJSON file of the AOI.
+            boundary (Union[str, bytes]): A BBOX string, GeoJSON file of the AOI or bytes object.
                 The GeoJSON can contain multiple geometries.
             base (str): The base directory to cache map tile in
             source (str): The upstream data source for map tiles
@@ -195,7 +200,8 @@ class BaseMapper(object):
         url = re.sub(r"/{[xyz]+\}", "", url)
         url = url + r"/%s"
 
-        tms_params = {"name": name, "url": url, "suffix": suffix, "source": source}
+        tms_params = {"name": name, "url": url,
+                      "suffix": suffix, "source": source}
         log.debug(f"Setting custom TMS with params: {tms_params}")
         self.sources["custom"] = tms_params
         self.source = "custom"
@@ -223,7 +229,8 @@ class BaseMapper(object):
         info = get_cpu_info()
         cores = info["count"]
 
-        self.tiles = list(mercantile.tiles(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3], zoom))
+        self.tiles = list(mercantile.tiles(
+            self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3], zoom))
         total = len(self.tiles)
         log.info("%d tiles for zoom level %d" % (len(self.tiles), zoom))
         chunk = round(len(self.tiles) / cores)
@@ -239,10 +246,12 @@ class BaseMapper(object):
                 # results = []
                 block = 0
                 while block <= len(self.tiles):
-                    executor.submit(dlthread, self.base, mirrors, self.tiles[block : block + chunk], self.xy)
+                    executor.submit(dlthread, self.base, mirrors,
+                                    self.tiles[block: block + chunk], self.xy)
                     # result = executor.submit(dlthread, self.base, mirrors, self.tiles[block : block + chunk], self.xy)
                     # results.append(result)
-                    log.debug("Dispatching Block %d:%d" % (block, block + chunk))
+                    log.debug("Dispatching Block %d:%d" %
+                              (block, block + chunk))
                     block += chunk
                 executor.shutdown()
             # log.info("Had %r errors downloading %d tiles for data for %r" % (self.errors, len(tiles), Path(self.base).name))
@@ -272,63 +281,83 @@ class BaseMapper(object):
 
     def makeBbox(
         self,
-        boundary: str,
+        boundary : Union[str, bytes]
     ) -> tuple[float, float, float, float]:
         """Make a bounding box from a shapely geometry.
 
         Args:
-            boundary (str): A BBOX string or GeoJSON file of the AOI.
+            boundary (Union[str, bytes]): A BBOX string, GeoJSON file of the AOI or byte object.
                 The GeoJSON can contain multiple geometries.
 
         Returns:
             (list): The bounding box coordinates
         """
-        if not boundary.lower().endswith((".json", ".geojson")):
-            # Is BBOX string
-            try:
-                if "," in boundary:
-                    bbox_parts = boundary.split(",")
-                else:
-                    bbox_parts = boundary.split(" ")
-                bbox = tuple(float(x) for x in bbox_parts)
-                if len(bbox) == 4:
-                    # BBOX valid
-                    return bbox
-                else:
-                    msg = f"BBOX string malformed: {bbox}"
-                    log.error(msg)
-                    raise ValueError(msg) from None
-            except Exception as e:
-                log.error(e)
-                msg = f"Failed to parse BBOX string: {boundary}"
+
+        # Check the type of the boundary input
+        if isinstance(boundary, bytes):
+            # If it's a byte object decode to string
+            boundary = boundary.decode('utf-8')
+        else:
+            if not isinstance(boundary, str):
+                # If boundary is neither a byte object nor a string, raise an exception
+                raise TypeError("Boundary must be a string or byte object")
+
+        try:
+            # Try to load the GeoJSON data
+            if os.path.isfile(boundary):
+                # If boundary is a file path, load the file
+                with open(boundary, "r") as f:
+                    poly = geojson.load(f)
+            else:
+                try:
+                    # If boundary is not a file path, try parse it as GeoJSON
+                    poly = geojson.loads(boundary)
+                except:
+                    try:
+                        # If parsing as GeoJSON fails, try parse as a BBOX string
+                        if "," in boundary:
+                            bbox_parts = boundary.split(",")
+                        else:
+                            bbox_parts = boundary.split(" ")
+                        bbox = tuple(float(x) for x in bbox_parts)
+                        if len(bbox) == 4:
+                            # BBOX valid
+                            return bbox
+                        else:
+                            msg = f"BBOX string malformed: {bbox}"
+                            log.error(msg)
+                            raise ValueError(msg) from None
+                    except Exception as e:
+                        log.error(e)
+                        msg = f"Failed to parse BBOX string: {boundary}"
+                        log.error(msg)
+                        raise ValueError(msg) from None
+
+            # Extract geometry from the GeoJSON data
+            if "features" in poly:
+                geometry = shape(poly["features"][0]["geometry"])
+            elif "geometry" in poly:
+                geometry = shape(poly["geometry"])
+            else:
+                geometry = shape(poly)
+
+            if isinstance(geometry, list):
+                # If there are multiple geometries, create a union
+                log.debug("Creating union of multiple bbox geoms")
+                geometry = unary_union(geometry)
+
+            if geometry.is_empty:
+                msg = f"No bbox extracted from {geometry}"
                 log.error(msg)
                 raise ValueError(msg) from None
 
-        log.debug(f"Reading geojson file: {boundary}")
-        with open(boundary, "r") as f:
-            poly = geojson.load(f)
-        if "features" in poly:
-            geometry = shape(poly["features"][0]["geometry"])
-        elif "geometry" in poly:
-            geometry = shape(poly["geometry"])
-        else:
-            geometry = shape(poly)
-
-        if isinstance(geometry, list):
-            # Multiple geometries
-            log.debug("Creating union of multiple bbox geoms")
-            geometry = unary_union(geometry)
-
-        if geometry.is_empty:
-            msg = f"No bbox extracted from {geometry}"
-            log.error(msg)
-            raise ValueError(msg) from None
-
-        bbox = geometry.bounds
-        # left, bottom, right, top
-        # minX, minY, maxX, maxY
-        return bbox
-
+            # Get the bounding box coordinates
+            bbox = geometry.bounds
+            # left, bottom, right, top
+            # minX, minY, maxX, maxY
+            return bbox
+        except:
+            pass
 
 def tileid_from_y_tile(filepath: Union[Path | str]):
     """Helper function to get the tile id from a tile in z/x/y directory structure.
@@ -359,7 +388,8 @@ def tile_dir_to_pmtiles(outfile: str, tile_dir: str, bbox: tuple, attribution: s
     tile_dir = Path(tile_dir)
 
     # Get tile image format from the first file encountered
-    first_file = next((file for file in tile_dir.rglob("*.*") if file.is_file()), None)
+    first_file = next(
+        (file for file in tile_dir.rglob("*.*") if file.is_file()), None)
 
     if not first_file:
         err = "No tile files found in the specified directory. Aborting PMTile creation."
@@ -370,7 +400,8 @@ def tile_dir_to_pmtiles(outfile: str, tile_dir: str, bbox: tuple, attribution: s
     # tile_format = first_file.suffix.upper()
 
     # Get zoom levels from dirs
-    zoom_levels = sorted([int(x.stem) for x in tile_dir.glob("*") if x.is_dir()])
+    zoom_levels = sorted([int(x.stem)
+                         for x in tile_dir.glob("*") if x.is_dir()])
 
     # Process tiles
     with open(outfile, "wb") as pmtile_file:
@@ -439,7 +470,8 @@ def create_basemap_file(
         log.setLevel(logging.DEBUG)
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.DEBUG)
-        formatter = logging.Formatter("%(threadName)10s - %(name)s - %(levelname)s - %(message)s")
+        formatter = logging.Formatter(
+            "%(threadName)10s - %(name)s - %(levelname)s - %(message)s")
         ch.setFormatter(formatter)
         log.addHandler(ch)
 
@@ -454,9 +486,16 @@ def create_basemap_file(
         f"tms={tms}"
     )
 
-    # Validation
+    # Validating boundary
     if not boundary:
-        err = "You need to specify a boundary! (file or bbox)"
+        raise ValueError("Boundary must be provided")
+
+    if isinstance(boundary, BytesIO):
+        boundary = boundary.read()
+    elif isinstance(boundary, str):
+        boundary = boundary
+    else:
+        err = "Invalid boundary parameter. It should be a BytesIO object, a bounding box string, or a path to a GeoJSON file."
         log.error(err)
         raise ValueError(err)
 
@@ -532,8 +571,10 @@ def create_basemap_file(
 
 def main():
     """This main function lets this class be run standalone by a bash script."""
-    parser = argparse.ArgumentParser(description="Create an tile basemap for ODK Collect")
-    parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
+    parser = argparse.ArgumentParser(
+        description="Create an tile basemap for ODK Collect")
+    parser.add_argument("-v", "--verbose",
+                        action="store_true", help="verbose output")
     parser.add_argument(
         "-b",
         "--boundary",
@@ -544,12 +585,15 @@ def main():
         ),
     )
     parser.add_argument("-t", "--tms", help="Custom TMS URL")
-    parser.add_argument("--xy", default=False, help="Swap the X & Y coordinates when using a custom TMS")
+    parser.add_argument("--xy", default=False,
+                        help="Swap the X & Y coordinates when using a custom TMS")
     parser.add_argument(
         "-o", "--outfile", required=False, help="Output file name, allowed extensions [.mbtiles/.sqlitedb/.pmtiles]"
     )
-    parser.add_argument("-z", "--zooms", default="12-17", help="The Zoom levels")
-    parser.add_argument("-d", "--outdir", help="Output directory name for tile cache")
+    parser.add_argument("-z", "--zooms", default="12-17",
+                        help="The Zoom levels")
+    parser.add_argument(
+        "-d", "--outdir", help="Output directory name for tile cache")
     parser.add_argument(
         "-s",
         "--source",
@@ -572,7 +616,8 @@ def main():
     if len(args.boundary) == 1:
         if Path(args.boundary[0]).suffix not in [".json", ".geojson"]:
             log.error("")
-            log.error("*Error*: the boundary file must have .json or .geojson extension")
+            log.error(
+                "*Error*: the boundary file must have .json or .geojson extension")
             log.error("")
             parser.print_help()
             quit()
